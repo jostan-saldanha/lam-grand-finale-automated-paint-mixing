@@ -1,0 +1,29 @@
+{
+    "idf.espIdfPathWin": "C:\\esp\\v5.2.7\\esp-idf",
+    "idf.toolsPathWin": "C:\\Espressif\\tools",
+    "idf.pythonBinPathWin": "C:\\Espressif\\tools\\python\\v5.2.7\\venv\\Scripts\\python.exe",
+    "idf.openOcdConfigs": [
+        "board/esp32-bridge.cfg"
+    ],
+    "idf.portWin": "COM3",
+    "idf.projectPathWin": "${workspaceFolder}\\controller_esp32_1",
+    "idf.projectPath": "${workspaceFolder}/controller_esp32_1",
+    "idf.flashType": "UART",
+    "idf.target": "esp32",
+    "files.associations": {
+        "*.h": "cpp",
+        "*.cpp": "cpp",
+        "*.c": "c"
+    },
+    "idf.currentSetup": "C:\\esp\\v5.2.7\\esp-idf",
+    "idf.port": "COM4",
+    "idf.customExtraVars": {},
+    "clangd.path": "C:\\Espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=d:\\LAM Final\\build"
+    ],
+    "cmake.sourceDirectory": "D:/LAM Final/controller_esp32_1"
+}
+

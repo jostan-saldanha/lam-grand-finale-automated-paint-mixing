@@ -27,9 +27,12 @@
 // ---- UART link to ESP32 #1 (labelled TX/RX on the schematic) ----
 // Default Serial2 pins on NodeMCU-32S are RX2 = GPIO16, TX2 = GPIO17.
 // If ESP32 #1 shows "no data", the TX/RX pair is swapped: swap these two numbers.
-#define LINK_RX   16
-#define LINK_TX   17
-#define LINK_BAUD 115200
+#define LINK_RX        16
+#define LINK_TX        17
+#define LINK_BAUD      115200
+#define LINK_RX_PIN    16
+#define LINK_TX_PIN    17
+#define LINK_BAUD_RATE 115200
 
 // ---- Timing ----
 #define TX_PERIOD_MS     20      // 50 frames per second

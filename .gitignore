@@ -27,3 +27,10 @@ sdkconfig.ci
 Thumbs.db
 [Dd]esktop.ini
 .DS_Store
+
+# Compressed archives
+*.rar
+*.zip
+*.7z
+*.tar.gz
+

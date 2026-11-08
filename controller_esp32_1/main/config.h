@@ -20,23 +20,28 @@ static const int PIN_FSW[4] = {36, 39, 34, 35};          // FSW1..FSW4: GPIO 36,
 #define LINK_BAUD_RATE 115200
 
 // ============================================================================
-// 2. P&ID MAPPING (Confirmed from Hand-Drawn P&ID and BOM):
-//    - Red Line:    Driver 1 Ch1 (M1=PWM_1), Solenoid SV1, Flow sensor FT1 (FS1)
-//    - Yellow Line: Driver 1 Ch2 (M2=PWM_2), Solenoid SV2, Flow sensor FT2 (FS2)
-//    - Blue Line:   Driver 2 Ch1 (M1=PWM_3), Solenoid SV3, Flow sensor FT3 (FS3)
-//    - Flush Line:  Driver 2 Ch2 (M2=PWM_4), Solenoid SV4, Flow sensor FT4 (FS4)
-//    - All 3 colour lines direct into Mixing Tank (no shared manifold, no waste)
+// 2. P&ID MAPPING (Day 1 & Day 2 Architecture):
+//    - Red Line:    Driver 1 Ch1 (M1=PWM_1 / GPIO 32), Solenoid SV1 (GPIO 23), Flow sensor FT1 (FS1)
+//    - Yellow Line: Driver 1 Ch2 (M2=PWM_2 / GPIO 33), Solenoid SV2 (GPIO 22), Flow sensor FT2 (FS2)
+//    - Blue Line:   Driver 2 Ch1 (M1=PWM_3 / GPIO 25), Solenoid SV3 (GPIO 21), Flow sensor FT3 (FS3)
+//    - Flush Line:  Blue Pump / Line 3, Solenoid SV4 (GPIO 19), Flow sensor FT4 (FS4)
+//    - Chilling:    Driver 2 Ch2 (M2=PWM_4 / GPIO 26), Solenoid SV5 (GPIO 18) -> Ice Tank Recirculation
 // ============================================================================
 enum Line { L_RED = 0, L_BLUE = 1, L_YELLOW = 2, L_FLUSH = 3, NUM_LINES = 4 };
 static const char* LINE_NAME[NUM_LINES] = {"RED", "BLUE", "YELLOW", "FLUSH"};
-static const bool  LINE_ENABLED[NUM_LINES] = {true, true, true, false}; // Red, Blue, Yellow active; Flush disabled
+static const bool  LINE_ENABLED[NUM_LINES] = {true, true, true, true}; // All lines enabled for Day 2
 
-static const int LINE_PUMP[NUM_LINES] = {0, 2, 1, 3};   // Red->PWM_1, Blue->PWM_3, Yellow->PWM_2, Flush->PWM_4 (disabled)
-static const int LINE_SV[NUM_LINES]   = {0, 2, 1, 3};   // Red->SV1,   Blue->SV3,   Yellow->SV2,   Flush->SV4 (disabled)
-static const int LINE_FT[NUM_LINES]   = {0, 2, 1, 3};   // Red->FS1,   Blue->FS3,   Yellow->FS2,   Flush->FS4 (disabled)
-static const int SV_TANK_IDX  = 4;                      // SV-05: (spare on PCB)
-static const int SV_WASTE_IDX = 5;                      // SV-06: (spare on PCB)
+static const int LINE_PUMP[NUM_LINES] = {0, 2, 1, 2};   // Red->PWM_1, Blue->PWM_3, Yellow->PWM_2, Flush->PWM_3 (Blue pump)
+static const int LINE_SV[NUM_LINES]   = {0, 2, 1, 3};   // Red->SV1,   Blue->SV3,   Yellow->SV2,   Flush->SV4
+static const int LINE_FT[NUM_LINES]   = {0, 2, 1, 2};   // Red->FS1,   Blue->FS3,   Yellow->FS2,   Flush->FS3 (FT-03)
+
+// Day 2 Chilling Circuit Hardware Mapping (Schematic Sheet 1)
+static const int SV_CHILL_IDX   = 4;                    // SV-05: GPIO 18 (Solenoid Valve 5 on PCB)
+static const int PUMP_CHILL_CH  = 3;                    // Motor Driver 2 M2: GPIO 26 (PWM_4 on PCB) -> Pump 4
+static const int SV_TANK_IDX    = 4;                    // Legacy alias
+static const int SV_WASTE_IDX   = 5;                    // SV-06: (spare on PCB)
 static const bool HAVE_WASTE_VALVE = false;             // false = direct lines to tank, no waste valve
+static const float TARGET_DELTA_T = 5.0f;               // Day 2 Interlock Threshold: 5.0 C for fast bench demo, 10.0 C for formal task sheet
 
 // ============================================================================
 // 3. RECIPE: Mustard = 80 % yellow, 10 % blue, 10 % red of 3000 mL
@@ -46,13 +51,13 @@ static const float PCT[NUM_LINES] = {10.0f, 10.0f, 80.0f, 0.0f};   // by line: R
 static const int   DOSE_ORDER[3]  = {L_YELLOW, L_BLUE, L_RED};     // big dose first (2400 mL), small ones last (300 mL each)
 
 // ============================================================================
-// 4. PER-LINE CALIBRATION (Fitted from TEAM_DISTRO Physical Rig Regression)
-//    Regression Model from analysis/calibrate.py: Q = 0.009244 * f + 0.040111
-//    - Line 0 (Red / T1 / FS1):     Target 300 mL (10%)  -> K = 6.339 p/mL, Lead = 2.5 mL
-//    - Line 1 (Blue / T2 / FS2):    Target 300 mL (10%)  -> K = 6.339 p/mL, Lead = 2.5 mL
-//    - Line 2 (Yellow / T3 / FS3):  Target 2400 mL (80%) -> K = 6.360 p/mL, Lead = 3.5 mL
+// 4. PER-LINE CALIBRATION (Empirically Characterized on Physical Rig)
+//    - Line 0 (Red / T1 / FS1):     Target 300 mL (10%)  -> K = 0.654 p/mL, Lead = 2.5 mL
+//    - Line 1 (Blue / T2 / FS2):    Target 300 mL (10%)  -> K = 1.034 p/mL, Lead = 2.5 mL
+//    - Line 2 (Yellow / T3 / FS3):  Target 2400 mL (80%) -> K = 2.080 p/mL, Lead = 3.5 mL
+//    - Line 3 (Flush / FT4 / FS4):  Target 2000 mL       -> K = 1.723 p/mL (exact 2.0 L water calibration)
 // ============================================================================
-static const float DEFAULT_LINE_K[NUM_LINES]        = {0.654f, 1.034f, 2.080f, 0.654f}; // empirical p/mL (Red: 196p/300mL, Blue: 310p/300mL, Yellow: 4992p/2400mL)
+static const float DEFAULT_LINE_K[NUM_LINES]        = {0.654f, 1.034f, 2.080f, 1.723f}; // empirical p/mL
 static const float DEFAULT_LINE_FAST[NUM_LINES]     = {100.0f, 100.0f, 100.0f, 100.0f}; // Fast PWM duty % (Max flow: 10 mL/s)
 static const float DEFAULT_LINE_SLOW[NUM_LINES]     = {100.0f, 100.0f, 80.0f,  100.0f}; // Red & Blue run 100% PWM throughout
 static const float DEFAULT_LINE_LEAD[NUM_LINES]     = {2.5f,   2.5f,   3.5f,   2.5f};   // Early cutoff lead in mL

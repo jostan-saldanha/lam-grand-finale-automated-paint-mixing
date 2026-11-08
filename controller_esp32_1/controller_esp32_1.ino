@@ -29,6 +29,9 @@ static uint32_t cnt[5] = {0, 0, 0, 0, 0};     // pulse totals from ESP32 #2
 static uint32_t gFsw = 0, lastFrameMs = 0, goodFrames = 0, badFrames = 0;
 static bool     linkSeen = false;
 
+static float    gTemp1 = -999.0f;              // TS1: Red Tank (°C)
+static float    gTemp2 = -999.0f;              // TS2: Yellow Tank (°C)
+
 static float pumpPct[5]  = {0, 0, 0, 0, 0};
 static bool  valveOn[6]  = {false, false, false, false, false, false};
 
@@ -43,7 +46,6 @@ static uint32_t lastRunPulses = 0;
 // ---------------------------------------------------------------------------
 static void setValve(int idx, bool on) {
   if (idx < 0 || idx > 5) return;
-  if (idx == LINE_SV[L_FLUSH]) on = false; // Hard-disable flush valve (SV4)
   if (idx == SV_WASTE_IDX && !HAVE_WASTE_VALVE) return;
   valveOn[idx] = on;
   if (PIN_SV[idx] >= 0) digitalWrite(PIN_SV[idx], on ? HIGH : LOW);
@@ -55,11 +57,20 @@ static void allValvesOff() {
 
 static void setPumpPct(int ch, float pct) {
   if (ch < 0 || ch > 4) return;
-  if (ch == LINE_PUMP[L_FLUSH]) pct = 0; // Hard-disable flush pump (Motor Driver 2 M2 / PWM_4)
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   pumpPct[ch] = pct;
   if (PIN_PWM[ch] >= 0) ledcWrite(PIN_PWM[ch], (uint32_t)(pct * 255.0f / 100.0f + 0.5f));
+}
+
+static void setChilling(bool on, float pct = 100.0f) {
+  if (on) {
+    setValve(SV_CHILL_IDX, true);
+    setPumpPct(PUMP_CHILL_CH, pct);
+  } else {
+    setPumpPct(PUMP_CHILL_CH, 0.0f);
+    setValve(SV_CHILL_IDX, false);
+  }
 }
 
 static void allOff() {
@@ -110,16 +121,23 @@ static void parseFrame(const char* s) {
   unsigned int rx = 0;
   if (sscanf(star + 1, "%2x", &rx) != 1 || rx != x) { badFrames++; return; }
   unsigned long seq, ms, c1, c2, c3, c4, c5, fsw;
-  if (sscanf(s + 1, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu", &seq, &ms, &c1, &c2, &c3, &c4, &c5, &fsw) != 8) { badFrames++; return; }
+  float t1 = -999.0f, t2 = -999.0f;
+  int fields = sscanf(s + 1, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%f,%f",
+                      &seq, &ms, &c1, &c2, &c3, &c4, &c5, &fsw, &t1, &t2);
+  if (fields < 8) { badFrames++; return; }
   cnt[0] = (uint32_t)c1; cnt[1] = (uint32_t)c2; cnt[2] = (uint32_t)c3; cnt[3] = (uint32_t)c4; cnt[4] = (uint32_t)c5;
   gFsw = (uint32_t)fsw;
+  if (fields >= 10) {
+    gTemp1 = t1;
+    gTemp2 = t2;
+  }
   lastFrameMs = millis();
   linkSeen = true;
   goodFrames++;
 }
 
 static void readLink() {
-  static char buf[110];
+  static char buf[192];
   static uint8_t n = 0;
   while (LINK.available()) {
     char c = (char)LINK.read();
@@ -266,9 +284,11 @@ static bool doseLine(int line, float targetMl, bool toWaste, bool precise, DoseR
       const float flow = (d - lastPrintMl) / ((now - lastPrint) / 1000.0f) * 0.06f;   // mL/s -> L/min
       lastPrint = now;
       lastPrintMl = d;
-      Serial.printf("/*%.2f,%d,%d,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu*/\n",
+      float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+      Serial.printf("/*%.2f,%d,%d,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                     now / 1000.0f, line, phase, targetMl, d, pumpPct[pump], flow,
-                    (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                    (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                    gTemp1, gTemp2, dt_temp);
     }
     return true;
   };
@@ -491,9 +511,11 @@ static bool doseParallel(const int lines[], const float targets[], int nLines, D
       float targetDisp = (activeCount == 2) ? st[0].targetMl : BATCH_ML;
       float deliveredDisp = (activeCount == 2) ? fmaxf(st[0].deliveredMl, st[1].deliveredMl) : totDelivered;
 
-      Serial.printf("/*%.2f,-2,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu*/\n",
+      float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+      Serial.printf("/*%.2f,-2,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                     now / 1000.0f, targetDisp, deliveredDisp, maxDuty, flowLpm,
-                    (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                    (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                    gTemp1, gTemp2, dt_temp);
     }
 
     // Live console status line once per second
@@ -581,6 +603,248 @@ static bool runBatch(bool twoStage = false) {
 }
 
 // ---------------------------------------------------------------------------
+// Day 2 Sequence Steps (Step 1 Flush, Step 2 Thermal Interlock, Step 3 Recipe)
+// ---------------------------------------------------------------------------
+
+static bool runStep1FlushInternal(float targetMl) {
+  Serial.println("\n==========================================================");
+  Serial.printf(">>> DAY 2 - STEP 1: FLUSH BASE-COLOUR LINE (Target: %.1f mL) <<<\n", targetMl);
+  Serial.println("  Line: Blue Line (Pump 03 via PWM_3 / GPIO 25)");
+  Serial.println("  Valve: Flush Solenoid SV4 (GPIO 19)");
+  Serial.println("  Flow Sensor: FT-03 (FS3)");
+  Serial.println("  Discharge: 2.0 L Collection Jug");
+  Serial.println("==========================================================");
+
+  const int pump = LINE_PUMP[L_BLUE]; // Blue pump (Driver 2 Ch1 / PWM_3 / GPIO 25)
+  const int sv   = LINE_SV[L_FLUSH];  // SV4 (GPIO 19)
+  const int ft   = LINE_FT[L_BLUE];  // FT-03 / FS3
+  const float k  = cfg[L_FLUSH].kPpm;
+
+  allValvesOff();
+  setValve(sv, true); // Open SV4
+  bool ok = waitMs(SV_OPEN_LEAD_MS);
+  if (!ok) { allOff(); return false; }
+
+  const uint32_t basePulses = cnt[ft];
+  const uint32_t targetPulses = (uint32_t)(targetMl * k + 0.5f);
+  const float duty = 100.0f;
+
+  ok = rampPump(pump, 0.0f, duty, START_RAMP_MS);
+
+  uint32_t t0 = millis();
+  uint32_t lastPrint = millis();
+  uint32_t lastFlowCheck = millis();
+  uint32_t lastFlowPulses = cnt[ft];
+
+  while (ok && !gAbort) {
+    if (!waitMs(5)) { ok = false; break; }
+    uint32_t now = millis();
+    uint32_t curP = cnt[ft] - basePulses;
+    float curMl = (float)curP / k;
+
+    // No-flow interlock (> 10 seconds of pump ON with zero pulses)
+    if (now - lastFlowCheck >= 2000) {
+      uint32_t dp = cnt[ft] - lastFlowPulses;
+      lastFlowPulses = cnt[ft];
+      lastFlowCheck = now;
+      if (dp == 0 && (now - t0 > 10000)) {
+        fault("Step 1 Flush Interlock: No flow detected for > 10 s (tank empty or line blocked)!");
+        ok = false;
+        break;
+      }
+    }
+
+    // Telemetry stream
+    if (now - lastPrint >= 200) {
+      lastPrint = now;
+      Serial.printf("/*%.2f,3,1,%.1f,%.1f,100,0.00,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
+                    now / 1000.0f, targetMl, curMl,
+                    (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                    gTemp1, gTemp2, fabsf(gTemp2 - gTemp1));
+    }
+
+    // Check if target volume reached
+    if (curP >= targetPulses) {
+      Serial.printf("\n[STEP 1 COMPLETE] Target flush volume reached: %.1f mL (%lu pulses)!\n",
+                    curMl, (unsigned long)curP);
+      break;
+    }
+  }
+
+  setPumpPct(pump, 0.0f);
+  waitMs(SETTLE_MS);
+  setValve(sv, false);
+
+  if (ok && !gAbort) {
+    float finalMl = (float)(cnt[ft] - basePulses) / k;
+    Serial.printf("[STEP 1 SAFE STATE] Pump 03 OFF, SV4 CLOSED. Delivered: %.1f mL in %.1f s\n",
+                  finalMl, (millis() - t0) / 1000.0f);
+    return true;
+  }
+  allOff();
+  return false;
+}
+
+static bool runStep2ThermalInterlockInternal(float targetDeltaT, uint32_t timeoutSec) {
+  Serial.println("\n==========================================================");
+  Serial.printf(">>> DAY 2 - STEP 2: THERMAL INTERLOCK (Target: Delta-T >= %.1f C) <<<\n", targetDeltaT);
+  Serial.println("  Cooling Pump: Pump 4 (Driver 2 Ch2 / PWM_4 / GPIO 26)");
+  Serial.println("  Cooling Valve: Solenoid SV5 (GPIO 18)");
+  Serial.println("  Temp Sensor 1 (TS1 / GPIO 32): Red Tank (Cooled)");
+  Serial.println("  Temp Sensor 2 (TS2 / GPIO 13): Yellow Tank (Reference)");
+  Serial.printf("  Timeout: %lu seconds\n", (unsigned long)timeoutSec);
+  Serial.println("==========================================================");
+
+  allOff();
+  setChilling(true, 100.0f); // Open SV5 and start Pump 4 at 100%
+
+  uint32_t t0 = millis();
+  uint32_t lastPrint = millis();
+  uint32_t lastStatus = millis();
+  bool ok = true;
+  float currentDt = 0.0f;
+
+  while (ok && !gAbort) {
+    if (!waitMs(10)) { ok = false; break; }
+    uint32_t now = millis();
+
+    if (gTemp1 > -50.0f && gTemp2 > -50.0f) {
+      currentDt = fabsf(gTemp2 - gTemp1);
+    } else {
+      currentDt = 0.0f;
+    }
+
+    // Live telemetry stream to Serial Studio
+    if (now - lastPrint >= 200) {
+      lastPrint = now;
+      Serial.printf("/*%.2f,-4,2,%.1f,%.1f,100,0.00,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
+                    now / 1000.0f, targetDeltaT, currentDt,
+                    (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                    gTemp1, gTemp2, currentDt);
+    }
+
+    // Live console status line once per second
+    if (now - lastStatus >= 1000) {
+      lastStatus = now;
+      Serial.printf("[STEP 2 COOLING] TS1 (Red): %.2f C | TS2 (Yellow): %.2f C | Delta-T: %.2f C / %.1f C target | Time: %.1f s\n",
+                    gTemp1, gTemp2, currentDt, targetDeltaT, (now - t0) / 1000.0f);
+    }
+
+    // Condition check
+    if (currentDt >= targetDeltaT) {
+      Serial.printf("\n[STEP 2 INTERLOCK MET] Delta-T = %.2f C >= %.1f C reached!\n", currentDt, targetDeltaT);
+      break;
+    }
+
+    // Timeout check
+    if (now - t0 >= (timeoutSec * 1000)) {
+      fault("Step 2 Thermal Interlock: Timeout exceeded without reaching target Delta-T!");
+      ok = false;
+      break;
+    }
+  }
+
+  setChilling(false); // Stop Pump 4, close SV5
+  allOff();
+
+  if (ok && !gAbort) {
+    Serial.println("[STEP 2 SAFE STATE] Chilling Pump OFF, SV5 CLOSED. Handover to Step 3...");
+    return true;
+  }
+  return false;
+}
+
+static bool runDay2Sequence() {
+  if (!beginBusy()) return false;
+  Serial.println("\n##############################################################");
+  Serial.println("   LAM RESEARCH CHALLENGE 2026 - STAGE 3 - DAY 2 SEQUENCE    ");
+  Serial.println("   FULL 3-STEP AUTONOMOUS PROCESS (ZERO OPERATOR HANDOVER)   ");
+  Serial.println("##############################################################");
+
+  uint32_t tStart = millis();
+
+  // STEP 1: FLUSH
+  bool ok = runStep1FlushInternal(2000.0f);
+  if (!ok || gAbort) {
+    Serial.println("\n[DAY 2 ABORTED] Step 1 Flush failed or stopped!");
+    endBusy(false);
+    return false;
+  }
+
+  Serial.println("\n>>> Step 1 Complete. Auto-pausing 2 seconds for fluid settle...");
+  waitMs(2000);
+
+  // STEP 2: THERMAL INTERLOCK
+  ok = runStep2ThermalInterlockInternal(TARGET_DELTA_T, 300);
+  if (!ok || gAbort) {
+    Serial.println("\n[DAY 2 ABORTED] Step 2 Thermal Interlock failed or stopped!");
+    endBusy(false);
+    return false;
+  }
+
+  Serial.println("\n>>> Step 2 Complete. Auto-pausing 2 seconds before recipe dosing...");
+  waitMs(2000);
+
+  // STEP 3: MUSTARD RECIPE DOSING (3,000 mL)
+  Serial.println("\n==========================================================");
+  Serial.println(">>> DAY 2 - STEP 3: MUSTARD RECIPE PRECISION DOSING (3,000 mL) <<<");
+  Serial.println("  Yellow = 2,400 mL (80%) | Red = 300 mL (10%) | Blue = 300 mL (10%)");
+  Serial.println("==========================================================");
+
+  int lines[3] = {L_YELLOW, L_RED, L_BLUE};
+  float targets[3] = {
+    BATCH_ML * PCT[L_YELLOW] / 100.0f,
+    BATCH_ML * PCT[L_RED]    / 100.0f,
+    BATCH_ML * PCT[L_BLUE]   / 100.0f
+  };
+  DoseResult res[3];
+  ok = doseParallel(lines, targets, 3, res);
+
+  allOff();
+  uint32_t totalDuration = millis() - tStart;
+
+  if (ok && !gAbort) {
+    float tot = 0.0f;
+    Serial.println("\n##############################################################");
+    Serial.println("   DAY 2 AUTOMATED 3-STEP SEQUENCE SUCCESSFULLY COMPLETED!   ");
+    Serial.println("##############################################################");
+    Serial.println("  Step 1 Flush:      2,000.0 mL into Jug (Flow sensor FT-03 verified)");
+    Serial.printf("  Step 2 Interlock:  Reached Delta-T = %.2f C (TS1=%.2f C, TS2=%.2f C)\n",
+                  fabsf(gTemp2 - gTemp1), gTemp1, gTemp2);
+    Serial.println("  Step 3 Recipe Dosing Summary:");
+    for (int i = 0; i < 3; i++) {
+      int l = lines[i];
+      Serial.printf("    %-7s target %7.1f mL  delivered %7.1f mL  (%+.2f%%)\n",
+                    LINE_NAME[l], res[i].targetMl, res[i].deliveredMl,
+                    (res[i].deliveredMl - res[i].targetMl) / res[i].targetMl * 100.0f);
+      tot += res[i].deliveredMl;
+    }
+    Serial.printf("    TOTAL   target %7.1f mL  delivered %7.1f mL  (%+.2f%%)\n",
+                  BATCH_ML, tot, (tot - BATCH_ML) / BATCH_ML * 100.0f);
+    Serial.printf("  Total Elapsed Time: %.1f seconds\n", totalDuration / 1000.0f);
+    Serial.println("  Safe State: ALL PUMPS OFF (0% PWM), ALL VALVES CLOSED.");
+    Serial.println("##############################################################\n");
+  }
+
+  endBusy(ok);
+  return ok;
+}
+
+static bool runStep1Flush(float targetMl = 2000.0f) {
+  if (!beginBusy()) return false;
+  bool ok = runStep1FlushInternal(targetMl);
+  endBusy(ok);
+  return ok;
+}
+
+static bool runStep2ThermalInterlock(float targetDeltaT = 5.0f, uint32_t timeoutSec = 300) {
+  if (!beginBusy()) return false;
+  bool ok = runStep2ThermalInterlockInternal(targetDeltaT, timeoutSec);
+  endBusy(ok);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 static void saveCfg() {
@@ -624,6 +888,7 @@ static void loadCfg() {
     if (cfg[i].kPpm < 0.5f || cfg[i].kPpm > 3.0f) { cfg[i].kPpm = DEFAULT_LINE_K[i]; needSave = true; }
   }
   if (cfg[L_YELLOW].kPpm < 1.8f) { cfg[L_YELLOW].kPpm = DEFAULT_LINE_K[L_YELLOW]; needSave = true; }
+  if (cfg[L_FLUSH].kPpm < 1.4f)  { cfg[L_FLUSH].kPpm  = DEFAULT_LINE_K[L_FLUSH];  needSave = true; }
   if (needSave) saveCfg();
 }
 
@@ -659,9 +924,11 @@ static void cmdRun(int line, float duty, float sec, bool waste) {
         float curMl = (float)(uint32_t)(cnt[ft] - base) / cfg[line].kPpm;
         float flowLpm = (dt > 0.0f) ? (curMl - lastRunMl) / dt * 0.06f : 0.0f;
         lastRunMl = curMl;
-        Serial.printf("/*%.2f,%d,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu*/\n",
+        float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+        Serial.printf("/*%.2f,%d,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                       now / 1000.0f, line, sec * 10.0f, curMl, duty, flowLpm,
-                      (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                      (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                      gTemp1, gTemp2, dt_temp);
       }
     }
   }
@@ -776,21 +1043,28 @@ static int parseLine(const String &s) {
 }
 
 static void printHelp() {
-  Serial.println("---- commands (line = r|b|y|f or 0..3) ----");
-  Serial.println(" batch                    run the full Mustard batch (same as the start switch)");
-  Serial.println(" x                        stop everything");
-  Serial.println(" status                   link, counts, per-line settings");
-  Serial.println(" valve <1..6> <0|1>       manual valve test (SV-n)   pump <1..5> <duty>   manual PWM test");
-  Serial.println(" dose <line> <mL>         precise dose to the tank (then weigh, then 'meas')");
-  Serial.println(" run <line> <duty> <sec> [waste]   constant-duty run, reports pulses");
-  Serial.println(" meas <line> <actual_mL>  add a trial: K = total pulses / total mL (updates K)");
-  Serial.println(" clearcal <line>          forget trials for that line");
-  Serial.println(" sweep <line> [waste]     duty vs flow table, 20..100 %");
-  Serial.println(" deadband <line> [waste]  minimum duty where the pump starts / stops");
-  Serial.println(" coast <line> <duty> [waste]  overrun after stop = lead");
-  Serial.println(" flush [mL]               clean water through the header to waste");
-  Serial.println(" k|lead|slowfrac <line> <v>   duty <line> <fast> <slow>   trunk <mL>");
-  Serial.println(" save | load              store / restore settings in flash");
+  Serial.println("---- LAM Paint Mixing Controller Commands ----");
+  Serial.println(" day2                      START FULL DAY 2 SEQUENCE (Flush -> Thermal -> Mustard Recipe)");
+  Serial.println(" step1 [mL]                run Step 1: Flush Blue line (default 2000 mL into jug)");
+  Serial.println(" step2 [delta]             run Step 2: Thermal Interlock (default Delta-T >= 10.0 C)");
+  Serial.println(" cool [on|off|duty%]       control Chilling Pump 4 (Driver 2 M2) & Solenoid SV5");
+  Serial.println(" temp                      display live TS1, TS2, and Delta-T temperatures");
+  Serial.println(" batch / start             run the full Mustard batch (All 3 lines parallel)");
+  Serial.println(" start 2step               run Mustard batch (Yellow first, then Red & Blue)");
+  Serial.println(" dose rb <mL>              dose Red and Blue concurrently at equal PWM (e.g. dose rb 300)");
+  Serial.println(" dose <line> <mL>          dose specified line to mixing tank (e.g. dose y 2400)");
+  Serial.println(" x / stop                  emergency stop everything immediately");
+  Serial.println(" status                    show link, pulse counts, temperatures, and line config");
+  Serial.println(" valve <1..6> <0|1>        manually toggle a solenoid valve");
+  Serial.println(" pump <1..5> <duty%>       manually test pump duty");
+  Serial.println(" run <line> <duty> <sec>   constant-duty run, reports pulses");
+  Serial.println(" meas <line> <actual_mL>   trim K-factor from weighed volume");
+  Serial.println(" sweep <line>              duty vs flow table, 20..100 %");
+  Serial.println(" deadband <line>           minimum duty where the pump starts / stops");
+  Serial.println(" coast <line> <duty>       measure coast pulses and recommended lead");
+  Serial.println(" k|lead|slowfrac <line>    adjust tuning constants");
+  Serial.println(" default                   restore TEAM_DISTRO empirical calibration");
+  Serial.println(" save | load               store / restore settings in flash");
 }
 
 static void handleCommand(String cmd) {
@@ -804,9 +1078,55 @@ static void handleCommand(String cmd) {
   if (c == "help" || c == "?") { printHelp(); return; }
   if (c == "x" || c == "stop") { allOff(); Serial.println("[STOP] all outputs off"); return; }
 
+  if (c == "day2" || (c == "start" && n >= 2 && a[1] == "day2")) {
+    runDay2Sequence();
+    return;
+  }
+
+  if (c == "step1") {
+    float ml = (n >= 2 && a[1].toFloat() > 0) ? a[1].toFloat() : 2000.0f;
+    runStep1Flush(ml);
+    return;
+  }
+
+  if (c == "step2") {
+    float dt = (n >= 2 && a[1].toFloat() > 0) ? a[1].toFloat() : TARGET_DELTA_T;
+    runStep2ThermalInterlock(dt, 300);
+    return;
+  }
+
+  if (c == "cool") {
+    if (n >= 2 && a[1] == "off") {
+      setChilling(false);
+      Serial.println("[COOL] Chilling Pump 4 & SV5 OFF");
+    } else {
+      float pct = 100.0f;
+      if (n >= 2 && a[1] != "on") pct = a[1].toFloat();
+      if (n >= 3) pct = a[2].toFloat();
+      setChilling(true, pct);
+      Serial.printf("[COOL] Chilling Pump 4 ON (%.1f%% duty / PWM_4) | SV5 OPEN (GPIO 18)\n", pct);
+    }
+    return;
+  }
+
+  if (c == "temp") {
+    float dt = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+    Serial.println("\n[TEMPERATURE TELEMETRY]");
+    Serial.printf("  TS1 (GPIO 32 - Red Tank Cooled):   %.2f °C\n", gTemp1);
+    Serial.printf("  TS2 (GPIO 13 - Yellow Tank Ref):   %.2f °C\n", gTemp2);
+    Serial.printf("  Delta-T (|TS2 - TS1|):             %.2f °C  %s\n\n",
+                  dt, (dt >= 10.0f) ? "[OK: >= 10.0 C TARGET REACHED]" : "[BELOW 10.0 C TARGET]");
+    return;
+  }
+
   if (c == "status") {
-    Serial.printf("[STATUS] link=%s frames=%lu bad=%lu fsw=0x%lX trunk=%.1f mL waste_valve=%d\n", linkSeen ? "OK" : "NONE",
-                  (unsigned long)goodFrames, (unsigned long)badFrames, (unsigned long)gFsw, gTrunkMl, HAVE_WASTE_VALVE);
+    float dt = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+    Serial.printf("[STATUS] link=%s frames=%lu bad=%lu fsw=0x%lX\n", linkSeen ? "OK" : "NONE",
+                  (unsigned long)goodFrames, (unsigned long)badFrames, (unsigned long)gFsw);
+    Serial.printf("  Temperatures: TS1(Red Cooled)=%.2f C  TS2(Yellow Ref)=%.2f C  Delta-T=%.2f C\n",
+                  gTemp1, gTemp2, dt);
+    Serial.printf("  Chilling:     Pump 4 (PWM_4 / GPIO 26) = %.0f%% | SV5 (GPIO 18) = %s\n",
+                  pumpPct[PUMP_CHILL_CH], valveOn[SV_CHILL_IDX] ? "OPEN" : "CLOSED");
     for (int i = 0; i < NUM_LINES; i++) {
       Serial.printf("  %-6s K=%.4f p/mL  fast=%.0f%% slow=%.0f%% lead=%.1f mL slowfrac=%.2f  Pump:PWM_%d SV:SV%d FT%d count=%lu  trials=%d\n", LINE_NAME[i], cfg[i].kPpm,
                     cfg[i].dutyFast, cfg[i].dutySlow, cfg[i].leadMl, cfg[i].slowFrac, LINE_PUMP[i] + 1, LINE_SV[i] + 1, LINE_FT[i] + 1, (unsigned long)cnt[LINE_FT[i]], calCount[i]);
@@ -959,9 +1279,11 @@ void loop() {
         activeLine = i;
       }
     }
-    Serial.printf("/*%.2f,%d,0,0.0,0.0,%.0f,0.00,%lu,%lu,%lu,%lu*/\n",
+    float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+    Serial.printf("/*%.2f,%d,0,0.0,0.0,%.0f,0.00,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                   millis() / 1000.0f, activeLine, maxActiveDuty,
-                  (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                  (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                  gTemp1, gTemp2, dt_temp);
   }
   if (gStartReq && !gBusy) {
     gStartReq = false;

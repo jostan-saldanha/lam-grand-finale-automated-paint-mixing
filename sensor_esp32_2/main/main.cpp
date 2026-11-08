@@ -17,6 +17,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "config.h"
 
 static const char *TAG = "SENSOR_NODE";
@@ -28,6 +29,10 @@ static bool     unitOk[5]   = {false, false, false, false, false};
 static int      lastRaw[5]  = {0, 0, 0, 0, 0};
 static uint32_t total[5]    = {0, 0, 0, 0, 0};
 static uint32_t seqNo       = 0;
+
+static portMUX_TYPE dsMux   = portMUX_INITIALIZER_UNLOCKED;
+static float    gTemp1      = -999.0f; // TS1: Red Tank (°C)
+static float    gTemp2      = -999.0f; // TS2: Yellow Tank (°C)
 
 static void initCounter(int i) {
     if (FS_PIN[i] < 0) {
@@ -97,18 +102,128 @@ static uint32_t readFloats() {
     return v;
 }
 
+// ---------------------------------------------------------------------------
+// DS18B20 1-Wire Implementation (Dedicated Pins TS1=GPIO 32, TS2=GPIO 13)
+// ---------------------------------------------------------------------------
+static void dsPinInit(int pin) {
+    if (pin < 0) return;
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL << pin);
+    io_conf.mode = GPIO_MODE_INPUT_OUTPUT_OD; // Open drain allows bi-directional 1-Wire
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;   // 4.7k external on PCB + internal assist
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io_conf);
+    gpio_set_level((gpio_num_t)pin, 1);       // Default idle state HIGH
+}
+
+static bool dsReset(int pin) {
+    if (pin < 0) return false;
+    taskENTER_CRITICAL(&dsMux);
+    gpio_set_level((gpio_num_t)pin, 0);
+    esp_rom_delay_us(480);
+    gpio_set_level((gpio_num_t)pin, 1);
+    esp_rom_delay_us(70);
+    int presence = gpio_get_level((gpio_num_t)pin);
+    taskEXIT_CRITICAL(&dsMux);
+    esp_rom_delay_us(410);
+    return (presence == 0);
+}
+
+static void dsWriteBit(int pin, int bit) {
+    taskENTER_CRITICAL(&dsMux);
+    if (bit) {
+        gpio_set_level((gpio_num_t)pin, 0);
+        esp_rom_delay_us(6);
+        gpio_set_level((gpio_num_t)pin, 1);
+        esp_rom_delay_us(64);
+    } else {
+        gpio_set_level((gpio_num_t)pin, 0);
+        esp_rom_delay_us(60);
+        gpio_set_level((gpio_num_t)pin, 1);
+        esp_rom_delay_us(10);
+    }
+    taskEXIT_CRITICAL(&dsMux);
+}
+
+static int dsReadBit(int pin) {
+    taskENTER_CRITICAL(&dsMux);
+    gpio_set_level((gpio_num_t)pin, 0);
+    esp_rom_delay_us(3);
+    gpio_set_level((gpio_num_t)pin, 1);
+    esp_rom_delay_us(10);
+    int b = gpio_get_level((gpio_num_t)pin);
+    esp_rom_delay_us(55);
+    taskEXIT_CRITICAL(&dsMux);
+    return b;
+}
+
+static void dsWriteByte(int pin, uint8_t byte) {
+    for (int i = 0; i < 8; i++) {
+        dsWriteBit(pin, (byte >> i) & 1);
+    }
+}
+
+static uint8_t dsReadByte(int pin) {
+    uint8_t b = 0;
+    for (int i = 0; i < 8; i++) {
+        if (dsReadBit(pin)) b |= (1 << i);
+    }
+    return b;
+}
+
+static bool dsStartConvert(int pin) {
+    if (!dsReset(pin)) return false;
+    dsWriteByte(pin, 0xCC); // SKIP ROM (each pin has its own single probe)
+    dsWriteByte(pin, 0x44); // CONVERT T
+    return true;
+}
+
+static float dsReadTemp(int pin) {
+    if (!dsReset(pin)) return -999.0f;
+    dsWriteByte(pin, 0xCC); // SKIP ROM
+    dsWriteByte(pin, 0xBE); // READ SCRATCHPAD
+    uint8_t lsb = dsReadByte(pin);
+    uint8_t msb = dsReadByte(pin);
+    for (int i = 0; i < 7; i++) dsReadByte(pin); // Flush remaining scratchpad bytes
+    int16_t raw = (int16_t)((msb << 8) | lsb);
+    if (raw == -1 || raw == 0x0550) {
+        return -999.0f; // Disconnected or uninitialized reset value (85.0 C)
+    }
+    float temp = (float)raw * 0.0625f;
+    if (temp < -55.0f || temp > 125.0f) return -999.0f;
+    return temp;
+}
+
+// Background FreeRTOS task to sample temperatures every 1 second
+static void dsTask(void *pv) {
+    dsPinInit(PIN_TS1);
+    dsPinInit(PIN_TS2);
+    while (1) {
+        bool ok1 = dsStartConvert(PIN_TS1);
+        bool ok2 = dsStartConvert(PIN_TS2);
+        vTaskDelay(pdMS_TO_TICKS(750)); // 12-bit DS18B20 conversion delay
+        if (ok1) gTemp1 = dsReadTemp(PIN_TS1);
+        else gTemp1 = -999.0f;
+        if (ok2) gTemp2 = dsReadTemp(PIN_TS2);
+        else gTemp2 = -999.0f;
+        vTaskDelay(pdMS_TO_TICKS(250)); // 1 Hz total loop
+    }
+}
+
 static void sendFrame() {
-    char body[100];
+    char body[128];
     uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000);
-    int n = snprintf(body, sizeof(body), "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+    int n = snprintf(body, sizeof(body), "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.2f,%.2f",
                      (unsigned long)seqNo++, (unsigned long)nowMs,
                      (unsigned long)total[0], (unsigned long)total[1], (unsigned long)total[2],
-                     (unsigned long)total[3], (unsigned long)total[4], (unsigned long)readFloats());
+                     (unsigned long)total[3], (unsigned long)total[4], (unsigned long)readFloats(),
+                     gTemp1, gTemp2);
 
     uint8_t x = 0;
     for (int i = 0; i < n; i++) x ^= (uint8_t)body[i];
 
-    char out[128];
+    char out[160];
     int m = snprintf(out, sizeof(out), "$%s*%02X\n", body, x);
     uart_write_bytes(LINK_UART_NUM, out, m);
 }
@@ -147,8 +262,11 @@ static void initHardware() {
 }
 
 extern "C" void app_main() {
-    ESP_LOGI(TAG, "Starting ESP32 #2 Sensor Node (PCNT + UART2)");
+    ESP_LOGI(TAG, "Starting ESP32 #2 Sensor Node (PCNT + DS18B20 + UART2)");
     initHardware();
+
+    // Start background DS18B20 temperature measurement task
+    xTaskCreate(dsTask, "ds_temp", 3072, NULL, 2, NULL);
 
     int64_t lastTxUs = esp_timer_get_time();
     int64_t lastLogUs = esp_timer_get_time();
@@ -164,9 +282,10 @@ extern "C" void app_main() {
 
         if ((nowUs - lastLogUs) >= 1000000) {
             lastLogUs = nowUs;
-            ESP_LOGI(TAG, "Pulses FS1..5: %lu %lu %lu %lu %lu | FSW: %lu",
+            ESP_LOGI(TAG, "Pulses FS1..5: %lu %lu %lu %lu %lu | FSW: %lu | TS1(Red): %.2f C | TS2(Yel): %.2f C",
                      (unsigned long)total[0], (unsigned long)total[1], (unsigned long)total[2],
-                     (unsigned long)total[3], (unsigned long)total[4], (unsigned long)readFloats());
+                     (unsigned long)total[3], (unsigned long)total[4], (unsigned long)readFloats(),
+                     gTemp1, gTemp2);
         }
 
         vTaskDelay(1);

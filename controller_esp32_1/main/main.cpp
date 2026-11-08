@@ -35,6 +35,9 @@ static uint32_t goodFrames = 0;
 static uint32_t badFrames = 0;
 static bool     linkSeen = false;
 
+static float    gTemp1 = -999.0f;              // TS1: Red Tank (°C)
+static float    gTemp2 = -999.0f;              // TS2: Yellow Tank (°C)
+
 static float pumpPct[5]  = {0, 0, 0, 0, 0};
 static bool  valveOn[6]  = {false, false, false, false, false, false};
 
@@ -54,7 +57,6 @@ static inline uint32_t millis() {
 // ---------------------------------------------------------------------------
 static void setValve(int idx, bool on) {
     if (idx < 0 || idx > 5) return;
-    if (idx == LINE_SV[L_FLUSH]) on = false; // Hard-disable flush solenoid (SV4)
     valveOn[idx] = on;
     if (PIN_SV[idx] >= 0) {
         gpio_set_level((gpio_num_t)PIN_SV[idx], on ? 1 : 0);
@@ -67,7 +69,6 @@ static void allValvesOff() {
 
 static void setPumpPct(int ch, float pct) {
     if (ch < 0 || ch > 4) return;
-    if (ch == LINE_PUMP[L_FLUSH]) pct = 0.0f; // Hard-disable flush pump (Motor Driver 2 M2 / PWM_4)
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 100.0f) pct = 100.0f;
     pumpPct[ch] = pct;
@@ -76,6 +77,16 @@ static void setPumpPct(int ch, float pct) {
         uint32_t duty = (uint32_t)(pct * 255.0f / 100.0f + 0.5f);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch, duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch);
+    }
+}
+
+static void setChilling(bool on, float pct = 100.0f) {
+    if (on) {
+        setValve(SV_CHILL_IDX, true);
+        setPumpPct(PUMP_CHILL_CH, pct);
+    } else {
+        setPumpPct(PUMP_CHILL_CH, 0.0f);
+        setValve(SV_CHILL_IDX, false);
     }
 }
 
@@ -198,9 +209,11 @@ static bool doseLine(int line, float targetMl, bool precise, DoseResult &r) {
             const float flow = (d - lastPrintMl) / ((now - lastPrint) / 1000.0f) * 0.06f;   // mL/s -> L/min
             lastPrint = now;
             lastPrintMl = d;
-            printf("/*%.2f,%d,%d,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu*/\n",
+            float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+            printf("/*%.2f,%d,%d,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                    now / 1000.0f, line, phase, targetMl, d, pumpPct[pump], flow,
-                   (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                   (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                   gTemp1, gTemp2, dt_temp);
         }
         return true;
     };
@@ -426,9 +439,11 @@ static bool doseParallel(const int lines[], const float targets[], int nLines, D
             float targetDisp = (activeCount == 2) ? st[0].targetMl : BATCH_ML;
             float deliveredDisp = (activeCount == 2) ? fmaxf(st[0].deliveredMl, st[1].deliveredMl) : totDelivered;
 
-            printf("/*%.2f,-2,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu*/\n",
+            float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+            printf("/*%.2f,-2,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                    now / 1000.0f, targetDisp, deliveredDisp, maxDuty, flowLpm,
-                   (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                   (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                   gTemp1, gTemp2, dt_temp);
         }
 
         // Live console status line once per second
@@ -516,11 +531,253 @@ static bool runBatch(bool twoStage = false) {
 }
 
 // ---------------------------------------------------------------------------
+// Day 2 Sequence Steps (Step 1 Flush, Step 2 Thermal Interlock, Step 3 Recipe)
+// ---------------------------------------------------------------------------
+
+static bool runStep1FlushInternal(float targetMl) {
+    printf("\n==========================================================\n");
+    printf(">>> DAY 2 - STEP 1: FLUSH BASE-COLOUR LINE (Target: %.1f mL) <<<\n", targetMl);
+    printf("  Line: Blue Line (Pump 03 via PWM_3 / GPIO 25)\n");
+    printf("  Valve: Flush Solenoid SV4 (GPIO 19)\n");
+    printf("  Flow Sensor: FT-03 (FS3)\n");
+    printf("  Discharge: 2.0 L Collection Jug\n");
+    printf("==========================================================\n");
+
+    const int pump = LINE_PUMP[L_BLUE]; // Blue pump (Driver 2 Ch1 / PWM_3 / GPIO 25)
+    const int sv   = LINE_SV[L_FLUSH];  // SV4 (GPIO 19)
+    const int ft   = LINE_FT[L_BLUE];  // FT-03 / FS3
+    const float k  = cfg[L_FLUSH].kPpm;
+
+    allValvesOff();
+    setValve(sv, true); // Open SV4
+    bool ok = waitMs(SV_OPEN_LEAD_MS);
+    if (!ok) { allOff(); return false; }
+
+    const uint32_t basePulses = cnt[ft];
+    const uint32_t targetPulses = (uint32_t)(targetMl * k + 0.5f);
+    const float duty = 100.0f;
+
+    ok = rampPump(pump, 0.0f, duty, START_RAMP_MS);
+
+    uint32_t t0 = millis();
+    uint32_t lastPrint = millis();
+    uint32_t lastFlowCheck = millis();
+    uint32_t lastFlowPulses = cnt[ft];
+
+    while (ok && !gAbort) {
+        if (!waitMs(5)) { ok = false; break; }
+        uint32_t now = millis();
+        uint32_t curP = cnt[ft] - basePulses;
+        float curMl = (float)curP / k;
+
+        // No-flow interlock (> 10 seconds of pump ON with zero pulses)
+        if (now - lastFlowCheck >= 2000) {
+            uint32_t dp = cnt[ft] - lastFlowPulses;
+            lastFlowPulses = cnt[ft];
+            lastFlowCheck = now;
+            if (dp == 0 && (now - t0 > 10000)) {
+                fault("Step 1 Flush Interlock: No flow detected for > 10 s (tank empty or line blocked)!");
+                ok = false;
+                break;
+            }
+        }
+
+        // Telemetry stream
+        if (now - lastPrint >= 200) {
+            lastPrint = now;
+            printf("/*%.2f,3,1,%.1f,%.1f,100,0.00,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
+                   now / 1000.0f, targetMl, curMl,
+                   (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                   gTemp1, gTemp2, fabsf(gTemp2 - gTemp1));
+        }
+
+        // Check if target volume reached
+        if (curP >= targetPulses) {
+            printf("\n[STEP 1 COMPLETE] Target flush volume reached: %.1f mL (%lu pulses)!\n",
+                   curMl, (unsigned long)curP);
+            break;
+        }
+    }
+
+    setPumpPct(pump, 0.0f);
+    waitMs(SETTLE_MS);
+    setValve(sv, false);
+
+    if (ok && !gAbort) {
+        float finalMl = (float)(cnt[ft] - basePulses) / k;
+        printf("[STEP 1 SAFE STATE] Pump 03 OFF, SV4 CLOSED. Delivered: %.1f mL in %.1f s\n",
+               finalMl, (millis() - t0) / 1000.0f);
+        return true;
+    }
+    allOff();
+    return false;
+}
+
+static bool runStep2ThermalInterlockInternal(float targetDeltaT, uint32_t timeoutSec) {
+    printf("\n==========================================================\n");
+    printf(">>> DAY 2 - STEP 2: THERMAL INTERLOCK (Target: Delta-T >= %.1f C) <<<\n", targetDeltaT);
+    printf("  Cooling Pump: Pump 4 (Driver 2 Ch2 / PWM_4 / GPIO 26)\n");
+    printf("  Cooling Valve: Solenoid SV5 (GPIO 18)\n");
+    printf("  Temp Sensor 1 (TS1 / GPIO 32): Red Tank (Cooled)\n");
+    printf("  Temp Sensor 2 (TS2 / GPIO 13): Yellow Tank (Reference)\n");
+    printf("  Timeout: %lu seconds\n", (unsigned long)timeoutSec);
+    printf("==========================================================\n");
+
+    allOff();
+    setChilling(true, 100.0f); // Open SV5 and start Pump 4 at 100%
+
+    uint32_t t0 = millis();
+    uint32_t lastPrint = millis();
+    uint32_t lastStatus = millis();
+    bool ok = true;
+    float currentDt = 0.0f;
+
+    while (ok && !gAbort) {
+        if (!waitMs(10)) { ok = false; break; }
+        uint32_t now = millis();
+
+        if (gTemp1 > -50.0f && gTemp2 > -50.0f) {
+            currentDt = fabsf(gTemp2 - gTemp1);
+        } else {
+            currentDt = 0.0f;
+        }
+
+        // Live telemetry stream to Serial Studio
+        if (now - lastPrint >= 200) {
+            lastPrint = now;
+            printf("/*%.2f,-4,2,%.1f,%.1f,100,0.00,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
+                   now / 1000.0f, targetDeltaT, currentDt,
+                   (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                   gTemp1, gTemp2, currentDt);
+        }
+
+        // Live console status line once per second
+        if (now - lastStatus >= 1000) {
+            lastStatus = now;
+            printf("[STEP 2 COOLING] TS1 (Red): %.2f C | TS2 (Yellow): %.2f C | Delta-T: %.2f C / %.1f C target | Time: %.1f s\n",
+                   gTemp1, gTemp2, currentDt, targetDeltaT, (now - t0) / 1000.0f);
+        }
+
+        // Condition check
+        if (currentDt >= targetDeltaT) {
+            printf("\n[STEP 2 INTERLOCK MET] Delta-T = %.2f C >= %.1f C reached!\n", currentDt, targetDeltaT);
+            break;
+        }
+
+        // Timeout check
+        if (now - t0 >= (timeoutSec * 1000)) {
+            fault("Step 2 Thermal Interlock: Timeout exceeded without reaching target Delta-T!");
+            ok = false;
+            break;
+        }
+    }
+
+    setChilling(false); // Stop Pump 4, close SV5
+    allOff();
+
+    if (ok && !gAbort) {
+        printf("[STEP 2 SAFE STATE] Chilling Pump OFF, SV5 CLOSED. Handover to Step 3...\n");
+        return true;
+    }
+    return false;
+}
+
+static bool runDay2Sequence() {
+    if (!beginBusy()) return false;
+    printf("\n##############################################################\n");
+    printf("   LAM RESEARCH CHALLENGE 2026 - STAGE 3 - DAY 2 SEQUENCE    \n");
+    printf("   FULL 3-STEP AUTONOMOUS PROCESS (ZERO OPERATOR HANDOVER)   \n");
+    printf("##############################################################\n");
+
+    uint32_t tStart = millis();
+
+    // STEP 1: FLUSH
+    bool ok = runStep1FlushInternal(2000.0f);
+    if (!ok || gAbort) {
+        printf("\n[DAY 2 ABORTED] Step 1 Flush failed or stopped!\n");
+        endBusy(false);
+        return false;
+    }
+
+    printf("\n>>> Step 1 Complete. Auto-pausing 2 seconds for fluid settle...\n");
+    waitMs(2000);
+
+    // STEP 2: THERMAL INTERLOCK
+    ok = runStep2ThermalInterlockInternal(TARGET_DELTA_T, 300);
+    if (!ok || gAbort) {
+        printf("\n[DAY 2 ABORTED] Step 2 Thermal Interlock failed or stopped!\n");
+        endBusy(false);
+        return false;
+    }
+
+    printf("\n>>> Step 2 Complete. Auto-pausing 2 seconds before recipe dosing...\n");
+    waitMs(2000);
+
+    // STEP 3: MUSTARD RECIPE DOSING (3,000 mL)
+    printf("\n==========================================================\n");
+    printf(">>> DAY 2 - STEP 3: MUSTARD RECIPE PRECISION DOSING (3,000 mL) <<<\n");
+    printf("  Yellow = 2,400 mL (80%%) | Red = 300 mL (10%%) | Blue = 300 mL (10%%)\n");
+    printf("==========================================================\n");
+
+    int lines[3] = {L_YELLOW, L_RED, L_BLUE};
+    float targets[3] = {
+        BATCH_ML * PCT[L_YELLOW] / 100.0f,
+        BATCH_ML * PCT[L_RED]    / 100.0f,
+        BATCH_ML * PCT[L_BLUE]   / 100.0f
+    };
+    DoseResult res[3];
+    ok = doseParallel(lines, targets, 3, res);
+
+    allOff();
+    uint32_t totalDuration = millis() - tStart;
+
+    if (ok && !gAbort) {
+        float tot = 0.0f;
+        printf("\n##############################################################\n");
+        printf("   DAY 2 AUTOMATED 3-STEP SEQUENCE SUCCESSFULLY COMPLETED!   \n");
+        printf("##############################################################\n");
+        printf("  Step 1 Flush:      2,000.0 mL into Jug (Flow sensor FT-03 verified)\n");
+        printf("  Step 2 Interlock:  Reached Delta-T = %.2f C (TS1=%.2f C, TS2=%.2f C)\n",
+               fabsf(gTemp2 - gTemp1), gTemp1, gTemp2);
+        printf("  Step 3 Recipe Dosing Summary:\n");
+        for (int i = 0; i < 3; i++) {
+            int l = lines[i];
+            printf("    %-7s target %7.1f mL  delivered %7.1f mL  (%+.2f%%)\n",
+                   LINE_NAME[l], res[i].targetMl, res[i].deliveredMl,
+                   (res[i].deliveredMl - res[i].targetMl) / res[i].targetMl * 100.0f);
+            tot += res[i].deliveredMl;
+        }
+        printf("    TOTAL   target %7.1f mL  delivered %7.1f mL  (%+.2f%%)\n",
+               BATCH_ML, tot, (tot - BATCH_ML) / BATCH_ML * 100.0f);
+        printf("  Total Elapsed Time: %.1f seconds\n", totalDuration / 1000.0f);
+        printf("  Safe State: ALL PUMPS OFF (0%% PWM), ALL VALVES CLOSED.\n");
+        printf("##############################################################\n\n");
+    }
+
+    endBusy(ok);
+    return ok;
+}
+
+static bool runStep1Flush(float targetMl = 2000.0f) {
+    if (!beginBusy()) return false;
+    bool ok = runStep1FlushInternal(targetMl);
+    endBusy(ok);
+    return ok;
+}
+
+static bool runStep2ThermalInterlock(float targetDeltaT = 5.0f, uint32_t timeoutSec = 300) {
+    if (!beginBusy()) return false;
+    bool ok = runStep2ThermalInterlockInternal(targetDeltaT, timeoutSec);
+    endBusy(ok);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Calibration Commands
 // ---------------------------------------------------------------------------
 static void cmdRun(int line, float duty, float sec) {
-    if (line == L_FLUSH || !LINE_ENABLED[line]) {
-        printf("[ERROR] Line %s is disabled (flush tank is not used)\n", LINE_NAME[line]);
+    if (!LINE_ENABLED[line]) {
+        printf("[ERROR] Line %s is disabled\n", LINE_NAME[line]);
         return;
     }
     if (!beginBusy()) return;
@@ -545,9 +802,11 @@ static void cmdRun(int line, float duty, float sec) {
                 float curMl = (float)(uint32_t)(cnt[ft] - base) / cfg[line].kPpm;
                 float flowLpm = (dt > 0.0f) ? (curMl - lastRunMl) / dt * 0.06f : 0.0f;
                 lastRunMl = curMl;
-                printf("/*%.2f,%d,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu*/\n",
+                float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+                printf("/*%.2f,%d,1,%.1f,%.1f,%.0f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                        now / 1000.0f, line, sec * 10.0f, curMl, duty, flowLpm,
-                       (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                       (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                       gTemp1, gTemp2, dt_temp);
             }
         }
     }
@@ -698,6 +957,7 @@ static void loadCfg() {
         if (cfg[i].kPpm < 0.5f || cfg[i].kPpm > 3.0f) { cfg[i].kPpm = DEFAULT_LINE_K[i]; needSave = true; }
     }
     if (cfg[L_YELLOW].kPpm < 1.8f) { cfg[L_YELLOW].kPpm = DEFAULT_LINE_K[L_YELLOW]; needSave = true; }
+    if (cfg[L_FLUSH].kPpm < 1.4f)  { cfg[L_FLUSH].kPpm  = DEFAULT_LINE_K[L_FLUSH];  needSave = true; }
     if (needSave) saveCfg();
 }
 
@@ -714,20 +974,27 @@ static void parseFrame(const char* s) {
     if (sscanf(star + 1, "%2x", &rx) != 1 || rx != x) { badFrames++; return; }
 
     unsigned long seq, ms, c1, c2, c3, c4, c5, fsw;
-    if (sscanf(s + 1, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu", &seq, &ms, &c1, &c2, &c3, &c4, &c5, &fsw) != 8) {
+    float t1 = -999.0f, t2 = -999.0f;
+    int fields = sscanf(s + 1, "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%f,%f",
+                        &seq, &ms, &c1, &c2, &c3, &c4, &c5, &fsw, &t1, &t2);
+    if (fields < 8) {
         badFrames++;
         return;
     }
     cnt[0] = (uint32_t)c1; cnt[1] = (uint32_t)c2; cnt[2] = (uint32_t)c3;
     cnt[3] = (uint32_t)c4; cnt[4] = (uint32_t)c5;
     gFsw = (uint32_t)fsw;
+    if (fields >= 10) {
+        gTemp1 = t1;
+        gTemp2 = t2;
+    }
     lastFrameMs = millis();
     linkSeen = true;
     goodFrames++;
 }
 
 static void uartRxTask(void *pv) {
-    char buf[128];
+    char buf[192];
     int n = 0;
     uint8_t ch;
     while (1) {
@@ -792,12 +1059,17 @@ static int parseLineArg(const char* s) {
 
 static void printHelp() {
     printf("\n---- LAM Paint Mixing Controller Commands ----\n");
+    printf(" day2                      START FULL DAY 2 SEQUENCE (Flush -> Thermal -> Mustard Recipe)\n");
+    printf(" step1 [mL]                run Step 1: Flush Blue line (default 2000 mL into jug)\n");
+    printf(" step2 [delta]             run Step 2: Thermal Interlock (default Delta-T >= 10.0 C)\n");
+    printf(" cool [on|off|duty%%]       control Chilling Pump 4 (Driver 2 M2) & Solenoid SV5\n");
+    printf(" temp                      display live TS1, TS2, and Delta-T temperatures\n");
     printf(" start                     start automated Mustard batch (All 3 lines parallel)\n");
     printf(" start 2step               start automated Mustard batch (Yellow first, then Red & Blue)\n");
     printf(" dose rb <mL>              dose Red and Blue concurrently at equal PWM (e.g. dose rb 300)\n");
     printf(" dose <line> <mL>          dose specified line to mixing tank (e.g. dose y 2400)\n");
     printf(" x / stop                  emergency stop everything immediately\n");
-    printf(" status                    show link, pulse counts, and line configurations\n");
+    printf(" status                    show link, pulse counts, temperatures, and line config\n");
     printf(" run <line> <duty> <sec>   constant-duty run, reports pulses for calibration\n");
     printf(" meas <line> <actual_mL>   trim K-factor from weighed volume\n");
     printf(" deadband <line>           detect pump starting and stopping duty\n");
@@ -823,6 +1095,13 @@ static void printStatus() {
     printf("  Flow Pulses: FS1(Red)=%lu  FS2(Yellow)=%lu  FS3(Blue)=%lu  FS4(Flush)=%lu  FS5=%lu\n",
            (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2],
            (unsigned long)cnt[3], (unsigned long)cnt[4]);
+
+    float dt = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+    printf("  Temperatures: TS1(Red Cooled)=%.2f C  TS2(Yellow Ref)=%.2f C  Delta-T=%.2f C  %s\n",
+           gTemp1, gTemp2, dt, (dt >= 10.0f) ? "[>= 10 C OK]" : "[WAITING]");
+    printf("  Chilling:     Pump 4 (PWM_4 / GPIO 26) = %.0f%% | SV5 (GPIO 18) = %s\n",
+           pumpPct[PUMP_CHILL_CH], valveOn[SV_CHILL_IDX] ? "OPEN" : "CLOSED");
+
     printf("  P&ID Lines Config:\n");
     for (int i = 0; i < NUM_LINES; i++) {
         printf("    [%-6s] %s | K=%.4f p/mL | Fast=%.0f%% | Slow=%.0f%% | Lead=%.1f mL | SlowFrac=%.2f | Pump: PWM_%d | SV: SV%d | FT: FS%d (%lu cnt)\n",
@@ -875,6 +1154,47 @@ static void handleCommand(char* cmd) {
     }
     if (strcmp(c, "save") == 0) { saveCfg(); return; }
 
+    if (strcmp(c, "day2") == 0 || (strcmp(c, "start") == 0 && n >= 2 && strcmp(tokens[1], "day2") == 0)) {
+        runDay2Sequence();
+        return;
+    }
+
+    if (strcmp(c, "step1") == 0) {
+        float ml = (n >= 2) ? atof(tokens[1]) : 2000.0f;
+        runStep1Flush(ml);
+        return;
+    }
+
+    if (strcmp(c, "step2") == 0) {
+        float dt = (n >= 2) ? atof(tokens[1]) : TARGET_DELTA_T;
+        runStep2ThermalInterlock(dt, 300);
+        return;
+    }
+
+    if (strcmp(c, "cool") == 0) {
+        if (n >= 2 && strcmp(tokens[1], "off") == 0) {
+            setChilling(false);
+            printf("[COOL] Chilling Pump 4 & SV5 OFF\n");
+        } else {
+            float pct = 100.0f;
+            if (n >= 2 && strcmp(tokens[1], "on") != 0) pct = atof(tokens[1]);
+            if (n >= 3) pct = atof(tokens[2]);
+            setChilling(true, pct);
+            printf("[COOL] Chilling Pump 4 ON (%.1f%% duty / PWM_4) | SV5 OPEN (GPIO 18)\n", pct);
+        }
+        return;
+    }
+
+    if (strcmp(c, "temp") == 0) {
+        float dt = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+        printf("\n[TEMPERATURE TELEMETRY]\n");
+        printf("  TS1 (GPIO 32 - Red Tank Cooled):   %.2f °C\n", gTemp1);
+        printf("  TS2 (GPIO 13 - Yellow Tank Ref):   %.2f °C\n", gTemp2);
+        printf("  Delta-T (|TS2 - TS1|):             %.2f °C  %s\n",
+               dt, (dt >= 10.0f) ? "[OK: >= 10.0 C TARGET REACHED]" : "[BELOW 10.0 C TARGET]");
+        return;
+    }
+
     if (strcmp(c, "batch") == 0 || strcmp(c, "start") == 0) {
         bool twoStage = (n >= 2 && (strcmp(tokens[1], "2step") == 0 || strcmp(tokens[1], "seq") == 0));
         runBatch(twoStage);
@@ -883,23 +1203,15 @@ static void handleCommand(char* cmd) {
 
     if (strcmp(c, "valve") == 0 && n >= 3) {
         int v = atoi(tokens[1]) - 1;
-        if (v == LINE_SV[L_FLUSH]) {
-            printf("[VALVE] SV%d is Flush Valve -> DISABLED (no flush tank in use)\n", v + 1);
-            return;
-        }
-        int state = atoi(tokens[2]);
-        setValve(v, state > 0);
-        printf("[VALVE] SV%d = %s\n", v + 1, state > 0 ? "OPEN" : "CLOSED");
+        bool state = (atoi(tokens[2]) > 0) || (strcasecmp(tokens[2], "on") == 0) || (strcasecmp(tokens[2], "open") == 0);
+        setValve(v, state);
+        printf("[VALVE] SV%d = %s\n", v + 1, state ? "OPEN" : "CLOSED");
         return;
     }
 
     if (strcmp(c, "pump") == 0 && n >= 3) {
         int p = atoi(tokens[1]) - 1;
-        if (p == LINE_PUMP[L_FLUSH]) {
-            printf("[PUMP] PWM_%d is Flush Pump -> DISABLED (Motor Driver 2 M2 offline)\n", p + 1);
-            return;
-        }
-        float d = atof(tokens[2]);
+        float d = (strcasecmp(tokens[2], "off") == 0) ? 0.0f : atof(tokens[2]);
         setPumpPct(p, d);
         printf("[PUMP] PWM_%d = %.1f%%\n", p + 1, d);
         return;
@@ -1001,9 +1313,11 @@ static void consoleTask(void *pv) {
                         activeLine = i;
                     }
                 }
-                printf("/*%.2f,%d,0,0.0,0.0,%.0f,0.00,%lu,%lu,%lu,%lu*/\n",
+                float dt_temp = (gTemp1 > -50.0f && gTemp2 > -50.0f) ? fabsf(gTemp2 - gTemp1) : 0.0f;
+                printf("/*%.2f,%d,0,0.0,0.0,%.0f,0.00,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f*/\n",
                        now / 1000.0f, activeLine, maxActiveDuty,
-                       (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3]);
+                       (unsigned long)cnt[0], (unsigned long)cnt[1], (unsigned long)cnt[2], (unsigned long)cnt[3],
+                       gTemp1, gTemp2, dt_temp);
             }
         }
 
